@@ -1,18 +1,21 @@
-import pytest
-from numbers import Number
-from io import BytesIO, StringIO
 import numpy as np
+import pytest
+import sys
+import unittest
+
+from io import BytesIO, StringIO
+from multiprocessing import get_context
+from numbers import Number
 from numpy.testing import assert_array_equal, assert_array_almost_equal
-from mujoco_py import (MjSim, MjSimPool, load_model_from_xml,
+# from threading import Thread, Event
+from PIL import Image
+
+from mujoco_py import (MjSim, load_model_from_xml,
                        load_model_from_path, MjSimState,
                        ignore_mujoco_warnings,
                        load_model_from_mjb)
-from mujoco_py import const, cymj
+from mujoco_py import const, cymj, functions
 from mujoco_py.tests.utils import compare_imgs
-import scipy.misc
-from threading import Thread, Event
-from multiprocessing import get_context
-import sys
 
 
 BASIC_MODEL_XML = """
@@ -37,6 +40,7 @@ BASIC_MODEL_XML = """
     </sensor>
 </mujoco>
 """
+
 
 def test_nested():
     model = load_model_from_xml(BASIC_MODEL_XML)
@@ -113,7 +117,6 @@ def test_mj_sim_buffers():
         return d
 
     sim = MjSim(model, nsubsteps=2, udd_callback=udd_callback)
-
     assert(sim.udd_state is not None)
     assert(sim.udd_state["foo"] == foo)
     assert(sim.udd_state["foo_2"].shape[0] == 2)
@@ -146,39 +149,6 @@ def test_mj_sim_buffers():
          "foo_2": np.array([foo, foo, foo])}
     with pytest.raises(AssertionError):
         sim.step()
-
-
-def test_mj_sim_pool_buffers():
-    model = load_model_from_xml(BASIC_MODEL_XML)
-
-    foo = 10
-
-    def udd_callback(sim):
-        return {"foo": foo}
-
-    sims = [MjSim(model, udd_callback=udd_callback) for _ in range(2)]
-    sim_pool = MjSimPool(sims, nsubsteps=2)
-
-    for i in range(len(sim_pool.sims)):
-        assert(sim_pool.sims[i].udd_state is not None)
-        assert(sim_pool.sims[i].udd_state["foo"] == 10)
-
-    foo = 11
-    sim_pool.step()
-    for i in range(len(sim_pool.sims)):
-        assert(sim_pool.sims[i].udd_state is not None)
-        assert(sim_pool.sims[i].udd_state["foo"] == 11)
-
-
-def test_mj_sim_pool_basics():
-    model = load_model_from_xml(BASIC_MODEL_XML)
-    sims = [MjSim(model) for _ in range(2)]
-    sim_pool = MjSimPool(sims, nsubsteps=2)
-
-    sim_pool.reset()
-    sim_pool.step()
-    sim_pool.forward()
-
 
 def test_data_attribute_getters():
     model = load_model_from_xml(BASIC_MODEL_XML)
@@ -362,6 +332,38 @@ def test_mj_warning_raises():
     with pytest.raises(Exception):
         # This should raise an exception due to the mujoco warning callback
         sim.step()
+
+
+def test_mj_error_called():
+    error_message = None
+
+    def error_callback(msg):
+        nonlocal error_message
+        error_message = msg.decode()
+
+    cymj.set_error_callback(error_callback)
+
+    functions.mju_error("error")
+
+    assert error_message == "error"
+
+
+def test_mj_error_raises():
+    def error_callback(msg):
+        raise RuntimeError(msg.decode())
+
+    cymj.set_error_callback(error_callback)
+
+    called = False
+
+    try:
+        with cymj.wrap_mujoco_warning():
+            functions.mju_error("error")
+    except RuntimeError as e:
+        assert e.args[0] == "error"
+        called = True
+
+    assert called
 
 
 def test_ignore_mujoco_warnings():
@@ -567,7 +569,12 @@ def test_rendering():
     depth = (depth - np.min(depth)) / (np.max(depth) - np.min(depth))
     depth = np.asarray(depth * 255, dtype=np.uint8)
     assert depth.shape == (200, 200)
-    compare_imgs(depth, 'test_rendering.freecam.depth.png')
+
+    # Unfortunately mujoco 2.0 renders slightly different depth image on mac and on linux here
+    if "darwin" in sys.platform.lower():
+        compare_imgs(depth, 'test_rendering.freecam.depth-darwin.png')
+    else:
+        compare_imgs(depth, 'test_rendering.freecam.depth.png')
 
     img = sim.render(100, 100, camera_name="camera1")
     assert img.shape == (100, 100, 3)
@@ -621,18 +628,6 @@ def test_viewercontext():
                         label="mark")
 
 
-@pytest.mark.requires_rendering
-def test_many_sims_rendering():
-    model = load_model_from_xml(BASIC_MODEL_XML)
-    sims = [MjSim(model) for _ in range(5)]
-    pool = MjSimPool(sims)
-    pool.forward()
-    for sim in sims:
-        img, depth = sim.render(200, 200, depth=True)
-        assert img.shape == (200, 200, 3)
-        compare_imgs(img, 'test_rendering.freecam.png')
-
-
 def test_xml_from_path():
     model = load_model_from_path("mujoco_py/tests/test.xml")
     sim = MjSim(model)
@@ -650,48 +645,12 @@ def test_sensors():
 
 
 @pytest.mark.requires_rendering
-@pytest.mark.skipif("Darwin" not in sys.platform,
-                    reason="Only Darwin code is thread safe.")
-def test_concurrent_rendering():
-    '''Best-effort testing that concurrent multi-threaded rendering works.
-    The test has no guarantees around being deterministic, but if it fails
-    you know something is wrong with concurrent rendering. If it passes,
-    things are probably working.'''
-    err = None
-    def func(sim, event):
-        event.wait()
-        sim.data.qpos[:] = 0.0
-        sim.forward()
-        img1 = sim.render(width=40, height=40, camera_name="camera1")
-        img2 = sim.render(width=40, height=40, camera_name="camera2")
-        try:
-            assert np.sum(img1[:]) == 23255
-            assert np.sum(img2[:]) == 12007
-        except Exception as e:
-            nonlocal err
-            err = e
-
-    model = load_model_from_xml(BASIC_MODEL_XML)
-    sim = MjSim(model)
-    sim.render(100, 100)
-    event = Event()
-    threads = []
-    for _ in range(100):
-        thread = Thread(target=func, args=(sim, event))
-        threads.append(thread)
-        thread.start()
-    event.set()
-    for thread in threads:
-        thread.join()
-    assert err is None, "Exception: %s" % (str(err))
-
-@pytest.mark.requires_rendering
 def test_high_res():
     model = load_model_from_xml(BASIC_MODEL_XML)
     sim = MjSim(model)
     sim.forward()
     img = sim.render(1000, 1000)
-    img = scipy.misc.imresize(img, (200, 200, 3))
+    img = np.array(Image.fromarray(img).resize(size=(200, 200)))
     assert img.shape == (200, 200, 3)
     compare_imgs(img, 'test_rendering.freecam.png')
 
@@ -718,9 +677,121 @@ def test_multiprocess():
 def import_process(queue):
     try:
         from mujoco_py import builder
-        mjpro_path, key_path = builder.discover_mujoco()
-        builder.load_cython_ext(mjpro_path)
+        mujoco_path, key_path = builder.discover_mujoco()
+        builder.load_cython_ext(mujoco_path)
     except Exception as e:
         queue.put(False)
     else:
         queue.put(True)
+
+
+class TestUserdata(unittest.TestCase):
+    def test_userdata(self):
+        xml = '''
+            <mujoco>
+                <size nuserdata="{}"/>
+                <worldbody>
+                    <body pos="0 0 0">
+                        <joint type="free"/>
+                        <geom type="sphere" size=".1"/>
+                    </body>
+                </worldbody>
+            </mujoco>
+        '''
+        model = load_model_from_xml(xml.format(1))
+        assert model.nuserdata == 1, 'bad nuserdata {}'.format(model.nuserdata)
+        model = load_model_from_xml(xml.format(10))
+        assert model.nuserdata == 10, 'bad nuserdata {}'.format(model.nuserdata)
+        sim = MjSim(model)
+        data = sim.data
+        assert data.userdata[0] == 0, 'bad userdata {}'.format(data.userdata)
+        data.userdata[0] = 1
+        assert data.userdata[0] == 1, 'bad userdata {}'.format(data.userdata)
+        # Check that we throw an assert if there's not enough userdata
+        model = load_model_from_xml(xml.format(0))
+        with self.assertRaises(AssertionError):
+            model.set_userdata_names(['foo'])
+        # Doesn't throw assert
+        model = load_model_from_xml(xml.format(1))
+        model.set_userdata_names(['foo'])
+        with self.assertRaises(AssertionError):
+            model.set_userdata_names(['foo', 'bar'])
+
+
+class TestRay(unittest.TestCase):
+    ''' Test raycasting '''
+    xml = '''
+        <mujoco>
+            <worldbody>
+                <geom name="A" type="sphere" size=".1" pos="1 0 0" rgba="1 0 0 1"/>
+                <body name="M" pos="0 0 0">
+                    <body name="N" pos="0 0 0">
+                        <geom name="B" type="sphere" size=".1" pos="3 0 0" rgba="0 1 0 1"/>
+                    </body>
+                <geom name="C" type="sphere" size=".1" pos="5 0 0" rgba="0 0 1 1"/>
+                </body>
+            </worldbody>
+        </mujoco>
+    '''
+
+    def check_ray(self, sim, pnt, expected_dist, expected_geom_name, **kwargs):
+        ''' Check a single raycast returns the expected distance and geom name '''
+        x = np.array([1.0, 0.0, 0.0])  # X direction
+        dist, geom = sim.ray(pnt, x, **kwargs)
+        self.assertAlmostEqual(dist, expected_dist)
+        if expected_geom_name is None:
+            self.assertEqual(geom, -1)
+        else:
+            self.assertEqual(sim.model.geom_id2name(geom), expected_geom_name)
+
+    def check_rays(self, sim, dists, names, **kwargs):
+        ''' Check a line of rays along the x axis for expected names and distances '''
+        x = np.array([1.0, 0.0, 0.0])  # X direction
+        for i, (dist, name) in enumerate(zip(dists, names)):
+            self.check_ray(sim, x * i, dist, name, **kwargs)
+
+    def test_ray(self):
+        ''' Test raycasting and exclusions '''
+        sim = MjSim(load_model_from_xml(self.xml))
+        sim.forward()
+
+        # Include all geoms
+        self.check_rays(sim,
+                        [0.9, 0.1, 0.9, 0.1, 0.9, 0.1, -1.0],
+                        ['A', 'A', 'B', 'B', 'C', 'C', None])
+
+        # Include static geoms, but exclude worldbody (which contains 'A')
+        self.check_rays(sim,
+                        [2.9, 1.9, 0.9, 0.1, 0.9, 0.1, -1.0],
+                        ['B', 'B', 'B', 'B', 'C', 'C', None],
+                        exclude_body=0)
+
+        # Include static geoms, and exclude body 1 (which contains 'C')
+        self.check_rays(sim,
+                        [0.9, 0.1, 0.9, 0.1, -1.0, -1.0, -1.0],
+                        ['A', 'A', 'B', 'B', None, None, None],
+                        exclude_body=1)
+
+        # Include static geoms, and exclude body 2 (which contains 'B')
+        self.check_rays(sim,
+                        [0.9, 0.1, 2.9, 1.9, 0.9, 0.1, -1.0],
+                        ['A', 'A', 'C', 'C', 'C', 'C', None],
+                        exclude_body=2)
+
+        # Exclude static geoms ('A' is the only static geom)
+        self.check_rays(sim,
+                        [2.9, 1.9, 0.9, 0.1, 0.9, 0.1, -1.0],
+                        ['B', 'B', 'B', 'B', 'C', 'C', None],
+                        include_static_geoms=False)
+
+        # Exclude static geoms, and exclude body 1 ('C')
+        self.check_rays(sim,
+                        [2.9, 1.9, 0.9, 0.1, -1.0, -1.0, -1.0],
+                        ['B', 'B', 'B', 'B', None, None, None],
+                        include_static_geoms=False, exclude_body=1)
+
+        # Exclude static geoms, and exclude body 2 (which contains 'B')
+        self.check_rays(sim,
+                        [4.9, 3.9, 2.9, 1.9, 0.9, 0.1, -1.0],
+                        ['C', 'C', 'C', 'C', 'C', 'C', None],
+                        include_static_geoms=False, exclude_body=2)

@@ -1,6 +1,7 @@
 from threading import Lock
 from mujoco_py.generated import const
 
+
 cdef class MjRenderContext(object):
     """
     Class that encapsulates rendering functionality for a
@@ -33,14 +34,15 @@ cdef class MjRenderContext(object):
 
     def __cinit__(self):
         maxgeom = 1000
-        mjv_makeScene(&self._scn, maxgeom)
+        mjv_makeScene(self._model_ptr, &self._scn, maxgeom)
         mjv_defaultCamera(&self._cam)
+        mjv_defaultPerturb(&self._pert)
         mjv_defaultOption(&self._vopt)
         mjr_defaultContext(&self._con)
 
-    def __init__(self, MjSim sim, bint offscreen=True, int device_id=-1):
+    def __init__(self, MjSim sim, bint offscreen=True, int device_id=-1, opengl_backend=None, quiet=False):
         self.sim = sim
-        self._setup_opengl_context(offscreen, device_id)
+        self._setup_opengl_context(offscreen, device_id, opengl_backend, quiet=quiet)
         self.offscreen = offscreen
 
         # Ensure the model data has been updated so that there
@@ -55,8 +57,11 @@ cdef class MjRenderContext(object):
         self.cam = WrapMjvCamera(&self._cam)
         self.vopt = WrapMjvOption(&self._vopt)
         self.con = WrapMjrContext(&self._con)
+
         self._pert.active = 0
         self._pert.select = 0
+        self._pert.skinselect = -1
+
         self.pert = WrapMjvPerturb(&self._pert)
 
         self._markers = []
@@ -87,15 +92,24 @@ cdef class MjRenderContext(object):
                 raise RuntimeError('Window rendering not supported')
         self.con = WrapMjrContext(&self._con)
 
-    def _setup_opengl_context(self, offscreen, device_id):
-        if not offscreen or sys.platform == 'darwin':
-            self.opengl_context = GlfwContext(offscreen=offscreen)
+    def _setup_opengl_context(self, offscreen, device_id, opengl_backend, quiet=False):
+        if opengl_backend is None and (not offscreen or sys.platform == 'darwin'):
+            # default to glfw for onscreen viewing or mac (both offscreen/onscreen)
+            opengl_backend = 'glfw'
+
+        if opengl_backend == 'glfw':
+            self.opengl_context = GlfwContext(offscreen=offscreen, quiet=quiet)
         else:
             if device_id < 0:
                 if "GPUS" in os.environ:
-                    device_id = int(os.environ["GPUS"].split(',')[0])
+                    device_id = os.environ["GPUS"]
                 else:
-                    device_id = int(os.getenv('CUDA_VISIBLE_DEVICES', '0').split(',')[0])
+                    device_id = os.getenv('CUDA_VISIBLE_DEVICES', '')
+                if len(device_id) > 0:
+                    device_id = int(device_id.split(',')[0])
+                else:
+                    # Sometimes env variable is an empty string.
+                    device_id = 0
             self.opengl_context = OffscreenOpenGLContext(device_id)
 
     def _init_camera(self, sim):
@@ -103,7 +117,7 @@ cdef class MjRenderContext(object):
         self.cam.type = const.CAMERA_FREE
         self.cam.fixedcamid = -1
         for i in range(3):
-            self.cam.lookat[i] = sim.model.stat.center[i]
+            self.cam.lookat[i] = np.median(sim.data.geom_xpos[:, i])
         self.cam.distance = sim.model.stat.extent
 
     def update_offscreen_size(self, width, height):
@@ -120,6 +134,9 @@ cdef class MjRenderContext(object):
         rect.width = width
         rect.height = height
 
+        if self.sim.render_callback is not None:
+            self.sim.render_callback(self.sim, self)
+
         # Sometimes buffers are too small.
         if width > self._con.offWidth or height > self._con.offHeight:
             new_width = max(width, self._model_ptr.vis.global_.offwidth)
@@ -133,7 +150,9 @@ cdef class MjRenderContext(object):
                 self.cam.type = const.CAMERA_FIXED
             self.cam.fixedcamid = camera_id
 
-        self.opengl_context.set_buffer_size(width, height)
+        # This doesn't really do anything else rather than checking for the size of buffer
+        # need to investigate further whi is that a no-op
+        # self.opengl_context.set_buffer_size(width, height)
 
         mjv_updateScene(self._model_ptr, self._data_ptr, &self._vopt,
                         &self._pert, &self._cam, mjCAT_ALL, &self._scn)
@@ -163,6 +182,17 @@ cdef class MjRenderContext(object):
             return (rgb_img, depth_img)
         else:
             return rgb_img
+
+    def read_pixels_depth(self, np.ndarray[np.float32_t, mode="c", ndim=2] buffer):
+            ''' Read depth pixels into a preallocated buffer '''
+            cdef mjrRect rect
+            rect.left = 0
+            rect.bottom = 0
+            rect.width = buffer.shape[1]
+            rect.height = buffer.shape[0]
+
+            cdef float[::view.contiguous] buffer_view = buffer.ravel()
+            mjr_readPixels(NULL, &buffer_view[0], rect, &self._con)
 
     def upload_texture(self, int tex_id):
         """ Uploads given texture to the GPU. """
@@ -253,6 +283,7 @@ class MjRenderContextWindow(MjRenderContext):
 
     def __init__(self, MjSim sim):
         super().__init__(sim, offscreen=False)
+        self.render_swap_callback = None
 
         assert isinstance(self.opengl_context, GlfwContext), (
             "Only GlfwContext supported for windowed rendering")
@@ -267,4 +298,6 @@ class MjRenderContextWindow(MjRenderContext):
 
         glfw.make_context_current(self.window)
         super().render(*glfw.get_framebuffer_size(self.window))
+        if self.render_swap_callback is not None:
+            self.render_swap_callback()
         glfw.swap_buffers(self.window)

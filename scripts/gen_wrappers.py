@@ -1,16 +1,23 @@
+#!/usr/bin/env python
+
+import codecs
 import os
+import pycparser
 import re
 import subprocess
+import sys
 import tempfile
+import traceback
+
+
 from collections import OrderedDict
-import sys
-import pycparser
-from pycparser.c_ast import ArrayDecl, TypeDecl, PtrDecl
-import sys
+from pycparser.c_ast import ArrayDecl, TypeDecl, PtrDecl, Union, BinaryOp, UnaryOp
+
 
 c_compiler = "cc"
 if sys.platform.startswith("win"):
     c_compiler = "cl"
+
 
 def tryint(x):
     try:
@@ -21,10 +28,11 @@ def tryint(x):
 
 def get_struct_dict(struct, struct_name, array_shapes):
     struct_dict = OrderedDict()
-    struct_dict[struct_name] = {'scalars': [],
-                                'arrays': [],
-                                'ptrs': [],
-                                'depends_on_model': False}
+    struct_dict[struct_name] = OrderedDict([('scalars', []),
+                                            ('arrays', []),
+                                            ('arrays2d', []),
+                                            ('ptrs', []),
+                                            ('depends_on_model', False)])
     for child in struct.children():
         child_name = child[1].name
         child_type = child[1].type
@@ -32,17 +40,22 @@ def get_struct_dict(struct, struct_name, array_shapes):
         if isinstance(child_type, ArrayDecl):
             if hasattr(decl.type.type, "names"):
                 array_type = ' '.join(decl.type.type.names)
-            else:
-                # TODO: support 2d arrays in cython.
-                print("skipping 2d array: %s" % child_name)
+                array_size = extract_size_info(decl.dim)
+                struct_dict[struct_name]['arrays'].append((child_name,
+                                                           array_type,
+                                                           array_size))
+            elif isinstance(decl.type, PtrDecl):
+                print("skipping pointer array: %s.%s" % (struct_name, child_name))
                 continue
-            if isinstance(decl.dim, pycparser.c_ast.ID):
-                array_size = decl.dim.name
+            elif hasattr(decl.type.type.type, "names"):
+                # assuming a 2d array
+                array_type = ' '.join(decl.type.type.type.names)
+                s1 = extract_size_info(decl.dim)
+                s2 = extract_size_info(decl.type.dim)
+                struct_dict[struct_name]['arrays2d'].append((child_name, array_type, (s1, s2)))
             else:
-                array_size = int(decl.dim.value)
-            struct_dict[struct_name]['arrays'].append((child_name,
-                                                       array_type,
-                                                       array_size))
+                print("skipping unknown array case: %s.%s\n%s" % (struct_name, child_name, child))
+
         elif isinstance(child_type, TypeDecl):
             if isinstance(decl.type, pycparser.c_ast.Struct):
                 fixed_name = decl.declname
@@ -72,16 +85,46 @@ def get_struct_dict(struct, struct_name, array_shapes):
                 # but currently that never happens.
                 if struct_name != 'mjModel':
                     struct_dict[struct_name]['depends_on_model'] = True
+        elif isinstance(child_type, Union):
+            # I'm ignoring unions for now until we think they're necessary
+            continue
         else:
             raise NotImplementedError
+
+    assert isinstance(struct_dict, OrderedDict), 'Must be deterministic'
     return struct_dict
+
+
+def extract_size_info(node):
+    """
+    Try to extract what integer value (or named reference) `node` contains.
+    Can handle
+
+        pycparser.c_ast.Constant
+        pycparser.c_ast.BinaryOp(op="*", left, right)
+        pycparser.c_ast.ID
+
+    as long as `left` and `right` are either `Constant` or BinaryOp's that ultimately evaluate to constants.
+
+    :param node: The AST node representing an integer constant.
+    :return: The value
+    """
+    if isinstance(node, pycparser.c_ast.ID):
+        return node.name
+    elif isinstance(node, BinaryOp):
+        if node.op == "*":
+            return extract_size_info(node.left) * extract_size_info(node.right)
+    elif isinstance(node, pycparser.c_ast.Constant):
+        return int(node.value)
+    raise NotImplementedError(str(node))
 
 
 def get_full_scr_lines(HEADER_DIR, HEADER_FILES):
     # ===== Read all header files =====
     file_contents = []
     for filename in HEADER_FILES:
-        with open(os.path.join(HEADER_DIR, filename), 'r') as f:
+        # mujoco 2.0 header files fail when parsed as utf-8
+        with codecs.open(os.path.join(HEADER_DIR, filename), 'r', encoding='latin-1') as f:
             file_contents.append(f.read())
     full_src_lines = [line.strip()
                       for line in '\n'.join(file_contents).splitlines()]
@@ -90,7 +133,7 @@ def get_full_scr_lines(HEADER_DIR, HEADER_FILES):
 
 def get_array_shapes(full_src_lines):
     #  ===== Parse array shape hints =====
-    array_shapes = {}
+    array_shapes = OrderedDict()
     curr_struct_name = None
     for line in full_src_lines:
         # Current struct name
@@ -133,8 +176,9 @@ def get_full_struct_dict(processed_src, array_shapes):
             assert struct.name.startswith('_mj')
             struct_name = struct.name[1:]  # take out leading underscore
             assert struct_name not in struct_dict
-            struct_dict = dict(
-                struct_dict, **get_struct_dict(struct, struct_name, array_shapes))
+            struct_dict = struct_dict.copy()
+            struct_dict.update(get_struct_dict(struct, struct_name, array_shapes))
+    assert isinstance(struct_dict, OrderedDict), 'Must be deterministic'
     return struct_dict
 
 
@@ -147,19 +191,45 @@ def get_const_from_enum(processed_src):
         assert (node[1].name is None) == isinstance(
             node[1].type, pycparser.c_ast.Struct)
         struct = node[1].children()[0][1]
+
+        # Check if it is an enum
         if hasattr(struct, "type") and isinstance(struct.type, pycparser.c_ast.Enum):
             lines.append(" # " + struct.type.name)
+
+            # enum list os a list of key-value enumerations
             enumlist = struct.children()[0][1].children()[0][1].children()
+
             last_value = None
+
             for _, enum in enumlist:
                 var = enum.name[2:]
+
+                # Enum has two parts - name and value
                 if enum.value is not None:
-                    children = enum.value.children()
-                    if len(children) > 0:
-                        value = children[1][1].value
+                    if isinstance(enum.value, BinaryOp):
+                        # An enum is actually a binary operation
+                        if enum.value.op == '<<':
+                            # Parse and evaluate simple constant expression. Will throw if it's anything more complex
+                            value = int(enum.value.children()[0][1].value) << int(enum.value.children()[1][1].value)
+                        else:
+                            raise NotImplementedError
+                    elif isinstance(enum.value, UnaryOp):
+                        # If we want to be correct we need to do a bit of parsing here....
+                        if enum.value.op == '-':
+                            # Again, if some assumptions I'm making here are not correct, this should throw
+                            value = -int(enum.value.expr.value)
+                        else:
+                            raise NotImplementedError
                     else:
-                        value = enum.value.value
-                    value = int(value)
+                        children = enum.value.children()
+
+                        if len(children) > 0:
+                            value = children[1][1].value
+                        else:
+                            value = enum.value.value
+
+                        value = int(value)
+
                     last_value = value
                     new_line = str(var) + " = " + str(value)
                     lines.append(new_line)
@@ -173,8 +243,8 @@ def get_const_from_enum(processed_src):
 
 def get_struct_wrapper(struct_dict):
     #  ===== Generate code =====
-    structname2wrappername = {}
-    structname2wrapfuncname = {}
+    structname2wrappername = OrderedDict()
+    structname2wrapfuncname = OrderedDict()
     for name in struct_dict:
         assert name.startswith('mj')
         structname2wrappername[name] = 'PyMj' + name[2:]
@@ -293,29 +363,49 @@ def _add_getters(obj_type):
 
 def get_const_from_define(full_src_lines):
     define_code = []
+    seen = set()
+
     for line in full_src_lines:
         define = "#define"
         if line.find(define) > -1:
             line = line[len(define):].strip()
             last_len = 100000
+
             while last_len != len(line):
                 last_len = len(line)
                 line = line.replace("  ", " ")
                 line = line.replace("\t", " ")
+
             comment = ""
+
             if line.find("//") > -1:
                 line, comment = line.split("//")
+
             line, comment = line.strip(), comment.strip()
+
             if line.find(" ") > -1:
                 var, val = line.split(" ")
                 try:
+                    # In C/C++ numbers can have an 'f' suffix, specifying a single-precision number.
+                    # That is not supported by the Python floating point parser, therefore we need to strip that bit.
+                    if val[-1] == 'f':
+                        val = val[:-1]
+
                     val = float(val)
-                    new_line = var[2:] + " = " + str(val)
+                    varname = var[2:]
+                    if varname in seen:
+                        print("Already seen {name}, skipping".format(name=varname))
+                        continue
+                    seen.add(varname)
+
+                    new_line = varname + " = " + str(val)
                     new_line += " " * (35 - len(new_line))
                     new_line += " # " + comment
                     define_code.append(new_line)
-                except:
+                except Exception:
+                    traceback.print_exc()
                     print("Couldn't parse line: %s" % line)
+
     return define_code
 
 
@@ -323,6 +413,7 @@ def get_funcs(fname):
     src = subprocess.check_output([c_compiler, '-E', '-P', fname]).decode()
     src = src[src.find("int mj_activat"):]
     l = -1
+
     while l != len(src):
         l = len(src)
         src = src.replace("  ", " ")
@@ -331,27 +422,39 @@ def get_funcs(fname):
         src = src.replace("const ", "")
         src = src.replace(", ", ",")
         src = src.strip()
+
     funcs = src.split(";")
     funcs = [f.strip() for f in funcs if len(f) > 0]
     ret = ""
     count = 0
+
     for f in funcs:
         ret_name = f.split(" ")[0]
         func_name = f.split(" ")[1].split("(")[0]
+
         args = f.split("(")[1][:-1]
         skip = False
+
         py_args_string = []
         c_args_string = []
+
         if args != "void":
             args = args.split(",")
+
             for arg in args:
                 arg = arg.strip()
                 data_type = " ".join(arg.split(" ")[:-1])
                 var_name = arg.split(" ")[-1]
+
                 if var_name.find("[") > -1:
                     #arr_size = var_name[var_name.find("[") + 1:var_name.find("]")]
                     data_type = data_type + "*"
                     var_name = var_name[:var_name.find("[")]
+
+                # Some words are keywords in Python that are not keywords in C/C++, therefore they can be used as
+                # variable identifiers. We need to handle these situations.
+                if var_name in ['def']:
+                    var_name = '_' + var_name
 
                 if data_type in ["char*"]:
                     py_args_string.append("str " + var_name)
@@ -369,6 +472,15 @@ def get_funcs(fname):
                         "np.ndarray[np.float64_t, mode=\"c\", ndim=1] " + var_name)
                     c_args_string.append("&%s[0]" % var_name)
                     continue
+                if data_type == "mjtByte":
+                    py_args_string.append("int " + var_name)
+                    c_args_string.append(var_name)
+                    continue
+                if data_type == "mjtByte*":
+                    py_args_string.append(
+                        "np.ndarray[np.uint8_t, mode=\"c\", ndim=1] " + var_name)
+                    c_args_string.append("&%s[0]" % var_name)
+                    continue
                 if data_type[:2] == "mj" and data_type[-1] == "*":
                     py_args_string.append(
                         "PyMj" + data_type[2:-1] + " " + var_name)
@@ -383,6 +495,11 @@ def get_funcs(fname):
                     py_args_string.append("int " + var_name)
                     c_args_string.append(var_name)
                     continue
+                if data_type in "int*":
+                    py_args_string.append("uintptr_t " + var_name)
+                    c_args_string.append("<int*>" + var_name)
+                    continue
+
                 # XXX
                 skip = True
 
@@ -410,25 +527,27 @@ def get_funcs(fname):
 
 
 def main():
-    HEADER_DIR = os.path.expanduser(os.path.join('~', '.mujoco', 'mjpro150', 'include'))
+    HEADER_DIR = os.path.expanduser(os.path.join('~', '.mujoco', 'mujoco200', 'include'))
     HEADER_FILES = [
         'mjmodel.h',
         'mjdata.h',
         'mjvisualize.h',
         'mjrender.h',
+        'mjui.h'
     ]
     if len(sys.argv) > 1:
         OUTPUT = sys.argv[1]
     else:
         OUTPUT = os.path.join('mujoco_py', 'generated', 'wrappers.pxi')
     OUTPUT_CONST = os.path.join('mujoco_py', 'generated', 'const.py')
+
     funcs = get_funcs(os.path.join(HEADER_DIR, "mujoco.h"))
     full_src_lines = get_full_scr_lines(HEADER_DIR, HEADER_FILES)
     array_shapes = get_array_shapes(full_src_lines)
     processed_src = get_processed_src(HEADER_DIR, full_src_lines)
     struct_dict = get_full_struct_dict(processed_src, array_shapes)
-    structname2wrappername, structname2wrapfuncname = get_struct_wrapper(
-        struct_dict)
+
+    structname2wrappername, structname2wrapfuncname = get_struct_wrapper(struct_dict)
 
     define_const = get_const_from_define(full_src_lines)
     enum_const = get_const_from_enum(processed_src)
@@ -449,12 +568,12 @@ def main():
         model_var_name = 'p' if name == 'mjModel' else 'model'
 
         # Disabling a few accessors that are unsafe due to ambiguous meaning.
-        REPLACEMENT_BY_ORIGINAL = {
-            'xpos': 'body_xpos',
-            'xmat': 'body_xmat',
-            'xquat': 'body_xquat',
-            'efc_pos': 'active_contacts_efc_pos',
-        }
+        REPLACEMENT_BY_ORIGINAL = OrderedDict([
+            ('xpos', 'body_xpos'),
+            ('xmat', 'body_xmat'),
+            ('xquat', 'body_xquat'),
+            ('efc_pos', 'active_contacts_efc_pos'),
+        ])
 
         for scalar_name, scalar_type in fields['scalars']:
             if scalar_type in ['float', 'int', 'mjtNum', 'mjtByte', 'unsigned int']:
@@ -553,6 +672,31 @@ def main():
                     '    @property\n    def {name}(self): return self._{name}'.format(name=array_name))
                 needed_1d_wrappers.add(array_type)
 
+        # 2D-Array types: handle the same way as pointers
+        for array_name, array_type, array_size in fields['arrays2d']:
+            if array_type in struct_dict:
+                print("Skipping 2d array of structs {name}.{arr_name}: <{arr_type}[:{arr_size0},:{arr_size1}]>".format(
+                    name=name,
+                    arr_name=array_name,
+                    arr_type=array_type,
+                    arr_size0=array_size[0],
+                    arr_size1=array_size[1])
+                )
+                continue
+            else:
+                member_decls.append(
+                    '    cdef np.ndarray _{}'.format(array_name))
+                member_initializers.append(
+                    '        self._{array_name} = _wrap_{array_type}_2d(&p.{array_name}[0][0], {size0}, {size1})'.format(
+                        array_name=array_name,
+                        array_type=array_type.replace(' ', '_'),
+                        size0=array_size[0],
+                        size1=array_size[1],
+                    ))
+                member_getters.append(
+                    '    @property\n    def {name}(self): return self._{name}'.format(name=array_name))
+                needed_2d_wrappers.add(array_type)
+
         member_getters = '\n'.join(member_getters)
         member_decls = '\n' + '\n'.join(member_decls) if member_decls else ''
         member_initializers = '\n' + \
@@ -565,19 +709,32 @@ def main():
         model_arg = ', model' if fields['depends_on_model'] else ''
 
         if name == "mjModel":
-            extra = '''
-    cdef readonly tuple body_names, joint_names, geom_names, site_names, light_names, camera_names, actuator_names, sensor_names
-    cdef readonly dict _body_id2name, _joint_id2name, _geom_id2name, _site_id2name, _light_id2name, _camera_id2name, _actuator_id2name, _sensor_id2name
-    cdef readonly dict _body_name2id, _joint_name2id, _geom_name2id, _site_name2id, _light_name2id, _camera_name2id, _actuator_name2id, _sensor_name2id
-'''
-            extra += _add_getters('body')
-            extra += _add_getters('joint')
-            extra += _add_getters('geom')
-            extra += _add_getters('site')
-            extra += _add_getters('light')
-            extra += _add_getters('camera')
-            extra += _add_getters('actuator')
-            extra += _add_getters('sensor')
+            extra = '\n'
+            obj_types = ['body',
+                         'joint',
+                         'geom',
+                         'site',
+                         'light',
+                         'camera',
+                         'actuator',
+                         'sensor',
+                         'tendon',
+                         'mesh']
+            obj_types_names = [o + '_names' for o in obj_types]
+            extra += '    cdef readonly tuple ' + ', '.join(obj_types_names) + '\n'
+            obj_types_id2names = ['_' + o + '_id2name' for o in obj_types]
+            extra += '    cdef readonly dict ' + ', '.join(obj_types_id2names) + '\n'
+            obj_types_name2ids = ['_' + o + '_name2id' for o in obj_types]
+            extra += '    cdef readonly dict ' + ', '.join(obj_types_name2ids) + '\n'
+            for obj_type in obj_types:
+                extra += _add_getters(obj_type)
+            # Note: named userdata fields are not present in MuJoCo,
+            # they're special accessors we add in mujoco-py.
+            # So these fields need to be python accessible instead of readonly.
+            extra += '    cdef public tuple userdata_names\n'
+            extra += '    cdef public dict _userdata_id2name\n'
+            extra += '    cdef public dict _userdata_name2id\n'
+            extra += _add_getters('userdata')
             extra += '''
     cdef inline tuple _extract_mj_names(self, mjModel* p, int*name_adr, int n, mjtObj obj_type):
         cdef char *name
@@ -616,6 +773,17 @@ def main():
                 mj_saveModel(self.ptr, filename.encode(), NULL, 0)
             return open(filename, 'rb').read()
 
+    def set_userdata_names(self, userdata_names):
+        assert isinstance(userdata_names, (list, tuple)), 'bad userdata names'
+        assert len(userdata_names) <= self.nuserdata, 'insufficient userdata'
+        self.userdata_names = tuple(userdata_names)
+        self._userdata_id2name = dict()
+        self._userdata_name2id = dict()
+        for i, name in enumerate(userdata_names):
+            assert isinstance(name, str), 'names must all be strings'
+            self._userdata_id2name[i] = name
+            self._userdata_name2id[name] = i
+
     def __dealloc__(self):
         mj_deleteModel(self.ptr)
 '''
@@ -634,6 +802,14 @@ def main():
                                                'actuator', 'actuator', 'ACTUATOR')
             extra_set += _set_body_identifiers('sensor',
                                                'sensor', 'sensor', 'SENSOR')
+            extra_set += _set_body_identifiers('tendon',
+                                               'tendon', 'tendon', 'TENDON')
+            extra_set += _set_body_identifiers('mesh',
+                                               'mesh', 'mesh', 'MESH')
+            # userdata_names is empty at construction time
+            extra_set += '        self.userdata_names = tuple()\n'
+            extra_set += '        self._userdata_name2id = dict()\n'
+            extra_set += '        self._userdata_id2name = dict()\n'
 
             for q_type in ('pos', 'vel'):
                 # Position dimensionality and degrees of freedom are different
@@ -714,6 +890,7 @@ def main():
             extra += _add_named_access_methods('light', 'light_xpos', 'xpos')
             extra += _add_named_access_methods('light', 'light_xdir', 'xdir')
             extra += _add_named_access_methods('sensor', 'sensordata', None)
+            extra += _add_named_access_methods('userdata', 'userdata', None)
 
             for pose_type in ('pos', 'quat'):
                 extra += """
@@ -848,6 +1025,7 @@ from tempfile import TemporaryDirectory
     print(len(code.splitlines()))
     with open(OUTPUT, 'w') as f:
         f.write(code)
+
 
 if __name__ == "__main__":
     main()
